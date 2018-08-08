@@ -19,9 +19,15 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/configs/configload"
 	"github.com/hashicorp/terraform/helper/logging"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/states/statefile"
+	"github.com/hashicorp/terraform/states/statemgr"
 	"github.com/hashicorp/terraform/terraform"
 )
 
@@ -188,40 +194,110 @@ func testReadPlan(t *testing.T, path string) *terraform.Plan {
 }
 
 // testState returns a test State structure that we use for a lot of tests.
-func testState() *terraform.State {
-	state := &terraform.State{
-		Modules: []*terraform.ModuleState{
-			&terraform.ModuleState{
-				Path: []string{"root"},
-				Resources: map[string]*terraform.ResourceState{
-					"test_instance.foo": &terraform.ResourceState{
-						Type: "test_instance",
-						Primary: &terraform.InstanceState{
-							ID: "bar",
-						},
-					},
-				},
-				Outputs: map[string]*terraform.OutputState{},
+func testState() *states.State {
+	return states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			addrs.Resource{
+				Mode: addrs.ManagedResourceMode,
+				Type: "test_instance",
+				Name: "foo",
+			}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: []byte(`{"id":"bar"}`),
+				Status:    states.ObjectReady,
 			},
-		},
-	}
-	state.Init()
-	return state
+			addrs.ProviderConfig{
+				Type: "test",
+			}.Absolute(addrs.RootModuleInstance),
+		)
+	})
 }
 
-func testStateFile(t *testing.T, s *terraform.State) string {
+// writeStateForTesting is a helper that writes the given naked state to the
+// given writer, generating a stub *statefile.File wrapper which is then
+// immediately discarded.
+func writeStateForTesting(state *states.State, w io.Writer) error {
+	sf := &statefile.File{
+		Serial:  0,
+		Lineage: "fake-for-testing",
+		State:   state,
+	}
+	return statefile.Write(sf, w)
+}
+
+// testStateMgrCurrentLineage returns the current lineage for the given state
+// manager, or the empty string if it does not use lineage. This is primarily
+// for testing against the local backend, which always supports lineage.
+func testStateMgrCurrentLineage(mgr statemgr.Persistent) string {
+	if pm, ok := mgr.(statemgr.PersistentMeta); ok {
+		m := pm.StateSnapshotMeta()
+		return m.Lineage
+	}
+	return ""
+}
+
+// markStateForMatching is a helper that writes a specific marker value to
+// a state so that it can be recognized later with getStateMatchingMarker.
+//
+// Internally this just sets a root module output value called "testing_mark"
+// to the given string value. If the state is being checked in other ways,
+// the test code may need to compensate for the addition or overwriting of this
+// special output value name.
+//
+// The given mark string is returned verbatim, to allow the following pattern
+// in tests:
+//
+//     mark := markStateForMatching(state, "foo")
+//     // (do stuff to the state)
+//     assertStateHasMarker(state, mark)
+func markStateForMatching(state *states.State, mark string) string {
+	state.RootModule().SetOutputValue("testing_mark", cty.StringVal(mark), false)
+	return mark
+}
+
+// getStateMatchingMarker is used with markStateForMatching to retrieve the
+// mark string previously added to the given state. If no such mark is present,
+// the result is an empty string.
+func getStateMatchingMarker(state *states.State) string {
+	os := state.RootModule().OutputValues["testing_mark"]
+	if os == nil {
+		return ""
+	}
+	v := os.Value
+	if v.Type() == cty.String && v.IsKnown() && !v.IsNull() {
+		return v.AsString()
+	}
+	return ""
+}
+
+// stateHasMarker is a helper around getStateMatchingMarker that also includes
+// the equality test, for more convenient use in test assertion branches.
+func stateHasMarker(state *states.State, want string) bool {
+	return getStateMatchingMarker(state) == want
+}
+
+// assertStateHasMarker wraps stateHasMarker to automatically generate a
+// fatal test result (i.e. t.Fatal) if the marker doesn't match.
+func assertStateHasMarker(t *testing.T, state *states.State, want string) {
+	if !stateHasMarker(state, want) {
+		t.Fatalf("wrong state marker\ngot:  %q\nwant: %q", getStateMatchingMarker(state), want)
+	}
+}
+
+func testStateFile(t *testing.T, s *states.State) string {
 	t.Helper()
 
 	path := testTempFile(t)
 
 	f, err := os.Create(path)
 	if err != nil {
-		t.Fatalf("err: %s", err)
+		t.Fatalf("failed to create temporary state file %s: %s", path, err)
 	}
 	defer f.Close()
 
-	if err := terraform.WriteState(s, f); err != nil {
-		t.Fatalf("err: %s", err)
+	err = writeStateForTesting(s, f)
+	if err != nil {
+		t.Fatalf("failed to write state to temporary file %s: %s", path, err)
 	}
 
 	return path
@@ -269,7 +345,7 @@ func testStateFileRemote(t *testing.T, s *terraform.State) string {
 }
 
 // testStateRead reads the state from a file
-func testStateRead(t *testing.T, path string) *terraform.State {
+func testStateRead(t *testing.T, path string) *states.State {
 	t.Helper()
 
 	f, err := os.Open(path)
@@ -278,12 +354,34 @@ func testStateRead(t *testing.T, path string) *terraform.State {
 	}
 	defer f.Close()
 
-	newState, err := terraform.ReadState(f)
+	sf, err := statefile.Read(f)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	return newState
+	return sf.State
+}
+
+// testDataStateRead reads a "data state", which is a file format resembling
+// our state format v3 that is used only to track current backend settings.
+//
+// This old format still uses *terraform.State, but should be replaced with
+// a more specialized type in a later release.
+func testDataStateRead(t *testing.T, path string) *terraform.State {
+	t.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer f.Close()
+
+	s, err := terraform.ReadState(f)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	return s
 }
 
 // testStateOutput tests that the state at the given path contains
